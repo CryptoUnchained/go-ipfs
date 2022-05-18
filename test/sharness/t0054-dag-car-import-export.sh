@@ -8,7 +8,7 @@ export -f ipfsi
 
 set -o pipefail
 
-tar -C ../t0054-dag-car-import-export-data/ --strip-components=1 -Jxf ../t0054-dag-car-import-export-data/test_dataset_car_v0.tar.xz
+tar -C ../t0054-dag-car-import-export-data/ --strip-components=1 -Jxf ../t0054-dag-car-import-export-data/test_dataset_car.tar.xz
 tab=$'\t'
 
 test_cmp_sorted() {
@@ -67,7 +67,7 @@ EOE
   # Explainer:
   # naked_root_import_json_expected output is produced by dag import of combined_naked_roots_genesis_and_128.car
   # executed when roots are already present in the repo - thus the BlockCount=0
-  # (if blocks were not present in the repo, blockstore: block not found would be returned)
+  # (if blocks were not present in the repo, ipld: could not find <CID> would be returned)
   cat >naked_root_import_json_expected <<EOE
 {"Root":{"Cid":{"/":"bafy2bzaceaxm23epjsmh75yvzcecsrbavlmkcxnva66bkdebdcnyw3bjrc74u"},"PinErrorMsg":""}}
 {"Root":{"Cid":{"/":"bafy2bzaced4ueelaegfs5fqu4tzsh6ywbbpfk3cxppupmxfdhbpbhzawfw5oy"},"PinErrorMsg":""}}
@@ -179,7 +179,7 @@ test_expect_success "basic offline export of 'getting started' dag works" '
 '
 
 
-echo "Error: block was not found locally (offline): QmYwAPJXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX not found (currently offline, perhaps retry after attaching to the network)" > offline_fetch_error_expected
+echo "Error: block was not found locally (offline): ipld: could not find QmYwAPJXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX (currently offline, perhaps retry after attaching to the network)" > offline_fetch_error_expected
 test_expect_success "basic offline export of nonexistent cid" '
   ! ipfs dag export QmYwAPJXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 2> offline_fetch_error_actual >/dev/null
 '
@@ -244,6 +244,23 @@ test_expect_success "ipfs dag import output has the correct error" '
 
 test_expect_success "ipfs dag import --allow-big-block works" '
     test_expect_code 0 ipfs dag import --allow-big-block 2-MB-block.car
+'
+
+cat > version_2_import_expected << EOE
+{"Root":{"Cid":{"/":"bafy2bzaceaxm23epjsmh75yvzcecsrbavlmkcxnva66bkdebdcnyw3bjrc74u"},"PinErrorMsg":""}}
+{"Root":{"Cid":{"/":"bafy2bzaced4ueelaegfs5fqu4tzsh6ywbbpfk3cxppupmxfdhbpbhzawfw5oy"},"PinErrorMsg":""}}
+{"Stats":{"BlockCount":1198,"BlockBytesCount":468513}}
+EOE
+
+test_expect_success "version 2 import" '
+  ipfs dag import --stats --enc=json \
+    ../t0054-dag-car-import-export-data/lotus_testnet_export_128_v2.car \
+    ../t0054-dag-car-import-export-data/lotus_devnet_genesis_v2.car \
+  > version_2_import_actual
+'
+
+test_expect_success "version 2 import output as expected" '
+  test_cmp_sorted version_2_import_expected version_2_import_actual
 '
 
 test_done

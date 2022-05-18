@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"mime"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	gopath "path"
@@ -25,6 +27,9 @@ import (
 	ipath "github.com/ipfs/interface-go-ipfs-core/path"
 	routing "github.com/libp2p/go-libp2p-core/routing"
 	prometheus "github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 )
 
 const (
@@ -33,8 +38,10 @@ const (
 	immutableCacheControl = "public, max-age=29030400, immutable"
 )
 
-var onlyAscii = regexp.MustCompile("[[:^ascii:]]")
-var noModtime = time.Unix(0, 0) // disables Last-Modified header if passed as modtime
+var (
+	onlyAscii = regexp.MustCompile("[[:^ascii:]]")
+	noModtime = time.Unix(0, 0) // disables Last-Modified header if passed as modtime
+)
 
 // HTML-based redirect for errors which can be recovered from, but we want
 // to provide hint to people that they should fix things on their end.
@@ -80,6 +87,25 @@ type statusResponseWriter struct {
 	http.ResponseWriter
 }
 
+// Custom type for collecting error details to be handled by `webRequestError`
+type requestError struct {
+	Message    string
+	StatusCode int
+	Err        error
+}
+
+func (r *requestError) Error() string {
+	return r.Err.Error()
+}
+
+func newRequestError(message string, err error, statusCode int) *requestError {
+	return &requestError{
+		Message:    message,
+		Err:        err,
+		StatusCode: statusCode,
+	}
+}
+
 func (sw *statusResponseWriter) WriteHeader(code int) {
 	// Check if we need to adjust Status Code to account for scheduled redirect
 	// This enables us to return payload along with HTTP 301
@@ -91,6 +117,54 @@ func (sw *statusResponseWriter) WriteHeader(code int) {
 		log.Debugw("subdomain redirect", "location", redirect, "status", code)
 	}
 	sw.ResponseWriter.WriteHeader(code)
+}
+
+// ServeContent replies to the request using the content in the provided ReadSeeker
+// and returns the status code written and any error encountered during a write.
+// It wraps http.ServeContent which takes care of If-None-Match+Etag,
+// Content-Length and range requests.
+func ServeContent(w http.ResponseWriter, req *http.Request, name string, modtime time.Time, content io.ReadSeeker) (int, bool, error) {
+	ew := &errRecordingResponseWriter{ResponseWriter: w}
+	http.ServeContent(ew, req, name, modtime, content)
+
+	// When we calculate some metrics we want a flag that lets us to ignore
+	// errors and 304 Not Modified, and only care when requested data
+	// was sent in full.
+	dataSent := ew.code/100 == 2 && ew.err == nil
+
+	return ew.code, dataSent, ew.err
+}
+
+// errRecordingResponseWriter wraps a ResponseWriter to record the status code and any write error.
+type errRecordingResponseWriter struct {
+	http.ResponseWriter
+	code int
+	err  error
+}
+
+func (w *errRecordingResponseWriter) WriteHeader(code int) {
+	if w.code == 0 {
+		w.code = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *errRecordingResponseWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if err != nil && w.err == nil {
+		w.err = err
+	}
+	return n, err
+}
+
+// ReadFrom exposes errRecordingResponseWriter's underlying ResponseWriter to io.Copy
+// to allow optimized methods to be taken advantage of.
+func (w *errRecordingResponseWriter) ReadFrom(r io.Reader) (n int64, err error) {
+	n, err = io.Copy(w.ResponseWriter, r)
+	if err != nil && w.err == nil {
+		w.err = err
+	}
+	return n, err
 }
 
 func newGatewaySummaryMetric(name string, help string) *prometheus.SummaryVec {
@@ -271,61 +345,22 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 	logger := log.With("from", r.RequestURI)
 	logger.Debug("http request received")
 
-	// X-Ipfs-Gateway-Prefix was removed (https://github.com/ipfs/go-ipfs/issues/7702)
-	// TODO: remove this after  go-ipfs 0.13 ships
-	if prfx := r.Header.Get("X-Ipfs-Gateway-Prefix"); prfx != "" {
-		err := fmt.Errorf("X-Ipfs-Gateway-Prefix support was removed: https://github.com/ipfs/go-ipfs/issues/7702")
-		webError(w, "unsupported HTTP header", err, http.StatusBadRequest)
+	if err := handleUnsupportedHeaders(r); err != nil {
+		webRequestError(w, err)
 		return
 	}
 
-	// ?uri query param support for requests produced by web browsers
-	// via navigator.registerProtocolHandler Web API
-	// https://developer.mozilla.org/en-US/docs/Web/API/Navigator/registerProtocolHandler
-	// TLDR: redirect /ipfs/?uri=ipfs%3A%2F%2Fcid%3Fquery%3Dval to /ipfs/cid?query=val
-	if uriParam := r.URL.Query().Get("uri"); uriParam != "" {
-		u, err := url.Parse(uriParam)
-		if err != nil {
-			webError(w, "failed to parse uri query parameter", err, http.StatusBadRequest)
-			return
-		}
-		if u.Scheme != "ipfs" && u.Scheme != "ipns" {
-			webError(w, "uri query parameter scheme must be ipfs or ipns", err, http.StatusBadRequest)
-			return
-		}
-		path := u.Path
-		if u.RawQuery != "" { // preserve query if present
-			path = path + "?" + u.RawQuery
-		}
-
-		redirectURL := gopath.Join("/", u.Scheme, u.Host, path)
-		logger.Debugw("uri param, redirect", "to", redirectURL, "status", http.StatusMovedPermanently)
-		http.Redirect(w, r, redirectURL, http.StatusMovedPermanently)
+	if requestHandled := handleProtocolHandlerRedirect(w, r, logger); requestHandled {
 		return
 	}
 
-	// Service Worker registration request
-	if r.Header.Get("Service-Worker") == "script" {
-		// Disallow Service Worker registration on namespace roots
-		// https://github.com/ipfs/go-ipfs/issues/4025
-		matched, _ := regexp.MatchString(`^/ip[fn]s/[^/]+$`, r.URL.Path)
-		if matched {
-			err := fmt.Errorf("registration is not allowed for this scope")
-			webError(w, "navigator.serviceWorker", err, http.StatusBadRequest)
-			return
-		}
+	if err := handleServiceWorkerRegistration(r); err != nil {
+		webRequestError(w, err)
+		return
 	}
 
 	contentPath := ipath.New(r.URL.Path)
-	if pathErr := contentPath.IsValid(); pathErr != nil {
-		if fixupSuperfluousNamespace(w, r.URL.Path, r.URL.RawQuery) {
-			// the error was due to redundant namespace, which we were able to fix
-			// by returning error/redirect page, nothing left to do here
-			logger.Debugw("redundant namespace; noop")
-			return
-		}
-		// unable to fix path, returning error
-		webError(w, "invalid ipfs path", pathErr, http.StatusBadRequest)
+	if requestHandled := handleSuperfluousNamespace(w, r, contentPath); requestHandled {
 		return
 	}
 
@@ -348,34 +383,35 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	// Detect when explicit Accept header or ?format parameter are present
-	responseFormat := customResponseFormat(r)
-
-	// Finish early if client already has matching Etag
-	if r.Header.Get("If-None-Match") == getEtag(r, resolvedPath.Cid()) {
-		w.WriteHeader(http.StatusNotModified)
-		return
-	}
-
-	// Update the global metric of the time it takes to read the final root block of the requested resource
-	// NOTE: for legacy reasons this happens before we go into content-type specific code paths
-	_, err = i.api.Block().Get(r.Context(), resolvedPath)
+	responseFormat, formatParams, err := customResponseFormat(r)
 	if err != nil {
-		webError(w, "ipfs block get "+resolvedPath.Cid().String(), err, http.StatusInternalServerError)
+		webError(w, "error while processing the Accept header", err, http.StatusBadRequest)
 		return
 	}
-	ns := contentPath.Namespace()
-	timeToGetFirstContentBlock := time.Since(begin).Seconds()
-	i.unixfsGetMetric.WithLabelValues(ns).Observe(timeToGetFirstContentBlock) // deprecated, use firstContentBlockGetMetric instead
-	i.firstContentBlockGetMetric.WithLabelValues(ns).Observe(timeToGetFirstContentBlock)
+	trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("ResponseFormat", responseFormat))
+	trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("ResolvedPath", resolvedPath.String()))
 
-	// HTTP Headers
-	i.addUserHeaders(w) // ok, _now_ write user's headers.
-	w.Header().Set("X-Ipfs-Path", contentPath.String())
+	// Detect when If-None-Match HTTP header allows returning HTTP 304 Not Modified
+	if inm := r.Header.Get("If-None-Match"); inm != "" {
+		pathCid := resolvedPath.Cid()
+		// need to check against both File and Dir Etag variants
+		// because this inexpensive check happens before we do any I/O
+		cidEtag := getEtag(r, pathCid)
+		dirEtag := getDirListingEtag(pathCid)
+		if etagMatch(inm, cidEtag, dirEtag) {
+			// Finish early if client already has a matching Etag
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
 
-	if rootCids, err := i.buildIpfsRootsHeader(contentPath.String(), r); err == nil {
-		w.Header().Set("X-Ipfs-Roots", rootCids)
-	} else { // this should never happen, as we resolved the contentPath already
-		webError(w, "error while resolving X-Ipfs-Roots", err, http.StatusInternalServerError)
+	if err := i.handleGettingFirstBlock(r, begin, contentPath, resolvedPath); err != nil {
+		webRequestError(w, err)
+		return
+	}
+
+	if err := i.setCommonHeaders(w, r, contentPath); err != nil {
+		webRequestError(w, err)
 		return
 	}
 
@@ -383,15 +419,16 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 	switch responseFormat {
 	case "": // The implicit response format is UnixFS
 		logger.Debugw("serving unixfs", "path", contentPath)
-		i.serveUnixFs(w, r, resolvedPath, contentPath, begin, logger)
+		i.serveUnixFS(r.Context(), w, r, resolvedPath, contentPath, begin, logger)
 		return
 	case "application/vnd.ipld.raw":
 		logger.Debugw("serving raw block", "path", contentPath)
-		i.serveRawBlock(w, r, resolvedPath.Cid(), contentPath, begin)
+		i.serveRawBlock(r.Context(), w, r, resolvedPath, contentPath, begin)
 		return
-	case "application/vnd.ipld.car", "application/vnd.ipld.car; version=1":
+	case "application/vnd.ipld.car":
 		logger.Debugw("serving car stream", "path", contentPath)
-		i.serveCar(w, r, resolvedPath.Cid(), contentPath, begin)
+		carVersion := formatParams["version"]
+		i.serveCAR(r.Context(), w, r, resolvedPath, contentPath, carVersion, begin)
 		return
 	default: // catch-all for unsuported application/vnd.*
 		err := fmt.Errorf("unsupported format %q", responseFormat)
@@ -601,6 +638,7 @@ func (i *gatewayHandler) deleteHandler(w http.ResponseWriter, r *http.Request) {
 	nnode, err := root.GetDirectory().GetNode()
 	if err != nil {
 		webError(w, "WritableGateway: failed to finalize", err, http.StatusInternalServerError)
+		return
 	}
 	ncid := nnode.Cid()
 
@@ -634,7 +672,6 @@ func addCacheControlHeaders(w http.ResponseWriter, r *http.Request, contentPath 
 
 		// TODO: set Cache-Control based on TTL of IPNS/DNSLink: https://github.com/ipfs/go-ipfs/issues/1818#issuecomment-1015849462
 		// TODO: set Last-Modified based on /ipns/ publishing timestamp?
-
 	} else {
 		// immutable! CACHE ALL THE THINGS, FOREVER! wolololol
 		w.Header().Set("Cache-Control", immutableCacheControl)
@@ -724,6 +761,10 @@ func (i *gatewayHandler) buildIpfsRootsHeader(contentPath string, r *http.Reques
 	return rootCidList, nil
 }
 
+func webRequestError(w http.ResponseWriter, err *requestError) {
+	webError(w, err.Message, err.Err, err.StatusCode)
+}
+
 func webError(w http.ResponseWriter, message string, err error, defaultCode int) {
 	if _, ok := err.(resolver.ErrNoLink); ok {
 		webErrorWithCode(w, message, err, http.StatusNotFound)
@@ -757,12 +798,77 @@ func getFilename(contentPath ipath.Path) string {
 	return gopath.Base(s)
 }
 
+// etagMatch evaluates if we can respond with HTTP 304 Not Modified
+// It supports multiple weak and strong etags passed in If-None-Matc stringh
+// including the wildcard one.
+func etagMatch(ifNoneMatchHeader string, cidEtag string, dirEtag string) bool {
+	buf := ifNoneMatchHeader
+	for {
+		buf = textproto.TrimString(buf)
+		if len(buf) == 0 {
+			break
+		}
+		if buf[0] == ',' {
+			buf = buf[1:]
+			continue
+		}
+		// If-None-Match: * should match against any etag
+		if buf[0] == '*' {
+			return true
+		}
+		etag, remain := scanETag(buf)
+		if etag == "" {
+			break
+		}
+		// Check for match both strong and weak etags
+		if etagWeakMatch(etag, cidEtag) || etagWeakMatch(etag, dirEtag) {
+			return true
+		}
+		buf = remain
+	}
+	return false
+}
+
+// scanETag determines if a syntactically valid ETag is present at s. If so,
+// the ETag and remaining text after consuming ETag is returned. Otherwise,
+// it returns "", "".
+// (This is the same logic as one executed inside of http.ServeContent)
+func scanETag(s string) (etag string, remain string) {
+	s = textproto.TrimString(s)
+	start := 0
+	if strings.HasPrefix(s, "W/") {
+		start = 2
+	}
+	if len(s[start:]) < 2 || s[start] != '"' {
+		return "", ""
+	}
+	// ETag is either W/"text" or "text".
+	// See RFC 7232 2.3.
+	for i := start + 1; i < len(s); i++ {
+		c := s[i]
+		switch {
+		// Character values allowed in ETags.
+		case c == 0x21 || c >= 0x23 && c <= 0x7E || c >= 0x80:
+		case c == '"':
+			return s[:i+1], s[i+1:]
+		default:
+			return "", ""
+		}
+	}
+	return "", ""
+}
+
+// etagWeakMatch reports whether a and b match using weak ETag comparison.
+func etagWeakMatch(a, b string) bool {
+	return strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")
+}
+
 // generate Etag value based on HTTP request and CID
 func getEtag(r *http.Request, cid cid.Cid) string {
 	prefix := `"`
 	suffix := `"`
-	responseFormat := customResponseFormat(r)
-	if responseFormat != "" {
+	responseFormat, _, err := customResponseFormat(r)
+	if err == nil && responseFormat != "" {
 		// application/vnd.ipld.foo → foo
 		f := responseFormat[strings.LastIndex(responseFormat, ".")+1:]
 		// Etag: "cid.foo" (gives us nice compression together with Content-Disposition in block (raw) and car responses)
@@ -773,14 +879,14 @@ func getEtag(r *http.Request, cid cid.Cid) string {
 }
 
 // return explicit response format if specified in request as query parameter or via Accept HTTP header
-func customResponseFormat(r *http.Request) string {
+func customResponseFormat(r *http.Request) (mediaType string, params map[string]string, err error) {
 	if formatParam := r.URL.Query().Get("format"); formatParam != "" {
 		// translate query param to a content type
 		switch formatParam {
 		case "raw":
-			return "application/vnd.ipld.raw"
+			return "application/vnd.ipld.raw", nil, nil
 		case "car":
-			return "application/vnd.ipld.car"
+			return "application/vnd.ipld.car", nil, nil
 		}
 	}
 	// Browsers and other user agents will send Accept header with generic types like:
@@ -789,10 +895,14 @@ func customResponseFormat(r *http.Request) string {
 	for _, accept := range r.Header.Values("Accept") {
 		// respond to the very first ipld content type
 		if strings.HasPrefix(accept, "application/vnd.ipld") {
-			return accept
+			mediatype, params, err := mime.ParseMediaType(accept)
+			if err != nil {
+				return "", nil, err
+			}
+			return mediatype, params, nil
 		}
 	}
-	return ""
+	return "", nil, nil
 }
 
 func (i *gatewayHandler) searchUpTreeFor404(r *http.Request, contentPath ipath.Path) (ipath.Resolved, string, error) {
@@ -846,32 +956,126 @@ func debugStr(path string) string {
 	return q
 }
 
+func handleUnsupportedHeaders(r *http.Request) (err *requestError) {
+	// X-Ipfs-Gateway-Prefix was removed (https://github.com/ipfs/go-ipfs/issues/7702)
+	// TODO: remove this after  go-ipfs 0.13 ships
+	if prfx := r.Header.Get("X-Ipfs-Gateway-Prefix"); prfx != "" {
+		err := fmt.Errorf("X-Ipfs-Gateway-Prefix support was removed: https://github.com/ipfs/go-ipfs/issues/7702")
+		return newRequestError("unsupported HTTP header", err, http.StatusBadRequest)
+	}
+	return nil
+}
+
+// ?uri query param support for requests produced by web browsers
+// via navigator.registerProtocolHandler Web API
+// https://developer.mozilla.org/en-US/docs/Web/API/Navigator/registerProtocolHandler
+// TLDR: redirect /ipfs/?uri=ipfs%3A%2F%2Fcid%3Fquery%3Dval to /ipfs/cid?query=val
+func handleProtocolHandlerRedirect(w http.ResponseWriter, r *http.Request, logger *zap.SugaredLogger) (requestHandled bool) {
+	if uriParam := r.URL.Query().Get("uri"); uriParam != "" {
+		u, err := url.Parse(uriParam)
+		if err != nil {
+			webError(w, "failed to parse uri query parameter", err, http.StatusBadRequest)
+			return true
+		}
+		if u.Scheme != "ipfs" && u.Scheme != "ipns" {
+			webError(w, "uri query parameter scheme must be ipfs or ipns", err, http.StatusBadRequest)
+			return true
+		}
+		path := u.Path
+		if u.RawQuery != "" { // preserve query if present
+			path = path + "?" + u.RawQuery
+		}
+
+		redirectURL := gopath.Join("/", u.Scheme, u.Host, path)
+		logger.Debugw("uri param, redirect", "to", redirectURL, "status", http.StatusMovedPermanently)
+		http.Redirect(w, r, redirectURL, http.StatusMovedPermanently)
+		return true
+	}
+
+	return false
+}
+
+// Disallow Service Worker registration on namespace roots
+// https://github.com/ipfs/go-ipfs/issues/4025
+func handleServiceWorkerRegistration(r *http.Request) (err *requestError) {
+	if r.Header.Get("Service-Worker") == "script" {
+		matched, _ := regexp.MatchString(`^/ip[fn]s/[^/]+$`, r.URL.Path)
+		if matched {
+			err := fmt.Errorf("registration is not allowed for this scope")
+			return newRequestError("navigator.serviceWorker", err, http.StatusBadRequest)
+		}
+	}
+
+	return nil
+}
+
 // Attempt to fix redundant /ipfs/ namespace as long as resulting
 // 'intended' path is valid.  This is in case gremlins were tickled
 // wrong way and user ended up at /ipfs/ipfs/{cid} or /ipfs/ipns/{id}
 // like in bafybeien3m7mdn6imm425vc2s22erzyhbvk5n3ofzgikkhmdkh5cuqbpbq :^))
-func fixupSuperfluousNamespace(w http.ResponseWriter, urlPath string, urlQuery string) bool {
-	if !(strings.HasPrefix(urlPath, "/ipfs/ipfs/") || strings.HasPrefix(urlPath, "/ipfs/ipns/")) {
-		return false // not a superfluous namespace
+func handleSuperfluousNamespace(w http.ResponseWriter, r *http.Request, contentPath ipath.Path) (requestHandled bool) {
+	// If the path is valid, there's nothing to do
+	if pathErr := contentPath.IsValid(); pathErr == nil {
+		return false
 	}
-	intendedPath := ipath.New(strings.TrimPrefix(urlPath, "/ipfs"))
+
+	// If there's no superflous namespace, there's nothing to do
+	if !(strings.HasPrefix(r.URL.Path, "/ipfs/ipfs/") || strings.HasPrefix(r.URL.Path, "/ipfs/ipns/")) {
+		return false
+	}
+
+	// Attempt to fix the superflous namespace
+	intendedPath := ipath.New(strings.TrimPrefix(r.URL.Path, "/ipfs"))
 	if err := intendedPath.IsValid(); err != nil {
-		return false // not a valid path
+		webError(w, "invalid ipfs path", err, http.StatusBadRequest)
+		return true
 	}
 	intendedURL := intendedPath.String()
-	if urlQuery != "" {
+	if r.URL.RawQuery != "" {
 		// we render HTML, so ensure query entries are properly escaped
-		q, _ := url.ParseQuery(urlQuery)
+		q, _ := url.ParseQuery(r.URL.RawQuery)
 		intendedURL = intendedURL + "?" + q.Encode()
 	}
 	// return HTTP 400 (Bad Request) with HTML error page that:
 	// - points at correct canonical path via <link> header
 	// - displays human-readable error
 	// - redirects to intendedURL after a short delay
+
 	w.WriteHeader(http.StatusBadRequest)
-	return redirectTemplate.Execute(w, redirectTemplateData{
+	if err := redirectTemplate.Execute(w, redirectTemplateData{
 		RedirectURL:   intendedURL,
 		SuggestedPath: intendedPath.String(),
-		ErrorMsg:      fmt.Sprintf("invalid path: %q should be %q", urlPath, intendedPath.String()),
-	}) == nil
+		ErrorMsg:      fmt.Sprintf("invalid path: %q should be %q", r.URL.Path, intendedPath.String()),
+	}); err != nil {
+		webError(w, "failed to redirect when fixing superfluous namespace", err, http.StatusBadRequest)
+	}
+
+	return true
+}
+
+func (i *gatewayHandler) handleGettingFirstBlock(r *http.Request, begin time.Time, contentPath ipath.Path, resolvedPath ipath.Resolved) *requestError {
+	// Update the global metric of the time it takes to read the final root block of the requested resource
+	// NOTE: for legacy reasons this happens before we go into content-type specific code paths
+	_, err := i.api.Block().Get(r.Context(), resolvedPath)
+	if err != nil {
+		return newRequestError("ipfs block get "+resolvedPath.Cid().String(), err, http.StatusInternalServerError)
+	}
+	ns := contentPath.Namespace()
+	timeToGetFirstContentBlock := time.Since(begin).Seconds()
+	i.unixfsGetMetric.WithLabelValues(ns).Observe(timeToGetFirstContentBlock) // deprecated, use firstContentBlockGetMetric instead
+	i.firstContentBlockGetMetric.WithLabelValues(ns).Observe(timeToGetFirstContentBlock)
+	return nil
+}
+
+func (i *gatewayHandler) setCommonHeaders(w http.ResponseWriter, r *http.Request, contentPath ipath.Path) *requestError {
+	i.addUserHeaders(w) // ok, _now_ write user's headers.
+	w.Header().Set("X-Ipfs-Path", contentPath.String())
+
+	if rootCids, err := i.buildIpfsRootsHeader(contentPath.String(), r); err == nil {
+		w.Header().Set("X-Ipfs-Roots", rootCids)
+	} else { // this should never happen, as we resolved the contentPath already
+		return newRequestError("error while resolving X-Ipfs-Roots", err, http.StatusInternalServerError)
+	}
+
+	return nil
 }

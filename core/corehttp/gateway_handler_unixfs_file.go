@@ -1,6 +1,7 @@
 package corehttp
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"mime"
@@ -10,17 +11,21 @@ import (
 	"time"
 
 	"github.com/gabriel-vasile/mimetype"
-	cid "github.com/ipfs/go-cid"
 	files "github.com/ipfs/go-ipfs-files"
+	"github.com/ipfs/go-ipfs/tracing"
 	ipath "github.com/ipfs/interface-go-ipfs-core/path"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // serveFile returns data behind a file along with HTTP headers based on
 // the file itself, its CID and the contentPath used for accessing it.
-func (i *gatewayHandler) serveFile(w http.ResponseWriter, r *http.Request, contentPath ipath.Path, fileCid cid.Cid, file files.File, begin time.Time) {
+func (i *gatewayHandler) serveFile(ctx context.Context, w http.ResponseWriter, r *http.Request, resolvedPath ipath.Resolved, contentPath ipath.Path, file files.File, begin time.Time) {
+	_, span := tracing.Span(ctx, "Gateway", "ServeFile", trace.WithAttributes(attribute.String("path", resolvedPath.String())))
+	defer span.End()
 
 	// Set Cache-Control and read optional Last-Modified time
-	modtime := addCacheControlHeaders(w, r, contentPath, fileCid)
+	modtime := addCacheControlHeaders(w, r, contentPath, resolvedPath.Cid())
 
 	// Set Content-Disposition
 	name := addContentDispositionHeader(w, r, contentPath)
@@ -78,10 +83,13 @@ func (i *gatewayHandler) serveFile(w http.ResponseWriter, r *http.Request, conte
 	// special fixup around redirects
 	w = &statusResponseWriter{w}
 
-	// Done: http.ServeContent will take care of
+	// ServeContent will take care of
 	// If-None-Match+Etag, Content-Length and range requests
-	http.ServeContent(w, r, name, modtime, content)
+	_, dataSent, _ := ServeContent(w, r, name, modtime, content)
 
-	// Update metrics
-	i.unixfsFileGetMetric.WithLabelValues(contentPath.Namespace()).Observe(time.Since(begin).Seconds())
+	// Was response successful?
+	if dataSent {
+		// Update metrics
+		i.unixfsFileGetMetric.WithLabelValues(contentPath.Namespace()).Observe(time.Since(begin).Seconds())
+	}
 }

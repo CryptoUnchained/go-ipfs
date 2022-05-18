@@ -1,5 +1,7 @@
 package config
 
+import rcmgr "github.com/libp2p/go-libp2p-resource-manager"
+
 type SwarmConfig struct {
 	// AddrFilters specifies a set libp2p addresses that we should never
 	// dial or receive connections from.
@@ -49,6 +51,9 @@ type SwarmConfig struct {
 
 	// ConnMgr configures the connection manager.
 	ConnMgr ConnMgr
+
+	// ResourceMgr configures the libp2p Network Resource Manager
+	ResourceMgr ResourceMgr
 }
 
 type RelayClient struct {
@@ -129,3 +134,19 @@ type ConnMgr struct {
 	HighWater   int
 	GracePeriod string
 }
+
+// ResourceMgr defines configuration options for the libp2p Network Resource Manager
+// <https://github.com/libp2p/go-libp2p-resource-manager#readme>
+type ResourceMgr struct {
+	// Enables the Network Resource Manager feature, default to on.
+	Enabled Flag                      `json:",omitempty"`
+	Limits  *rcmgr.BasicLimiterConfig `json:",omitempty"`
+}
+
+const (
+	ResourceMgrSystemScope         = "system"
+	ResourceMgrTransientScope      = "transient"
+	ResourceMgrServiceScopePrefix  = "svc:"
+	ResourceMgrProtocolScopePrefix = "proto:"
+	ResourceMgrPeerScopePrefix     = "peer:"
+)

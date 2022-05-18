@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 
+	oldcmds "github.com/ipfs/go-ipfs/commands"
 	cmdenv "github.com/ipfs/go-ipfs/core/commands/cmdenv"
 	nodeMount "github.com/ipfs/go-ipfs/fuse/node"
 
@@ -20,6 +21,7 @@ const (
 )
 
 var MountCmd = &cmds.Command{
+	Status: cmds.Experimental,
 	Helptext: cmds.HelpText{
 		Tagline: "Mounts IPFS to the filesystem (read-only).",
 		ShortDescription: `
@@ -81,7 +83,7 @@ baz
 		cmds.StringOption(mountIPNSPathOptionName, "n", "The path where IPNS should be mounted."),
 	},
 	Run: func(req *cmds.Request, res cmds.ResponseEmitter, env cmds.Environment) error {
-		cfg, err := cmdenv.GetConfig(env)
+		cfg, err := env.(*oldcmds.Context).GetConfig()
 		if err != nil {
 			return err
 		}

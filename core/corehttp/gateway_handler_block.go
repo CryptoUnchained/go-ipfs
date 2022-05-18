@@ -2,17 +2,23 @@ package corehttp
 
 import (
 	"bytes"
+	"context"
 	"io/ioutil"
 	"net/http"
 	"time"
 
-	cid "github.com/ipfs/go-cid"
+	"github.com/ipfs/go-ipfs/tracing"
 	ipath "github.com/ipfs/interface-go-ipfs-core/path"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // serveRawBlock returns bytes behind a raw block
-func (i *gatewayHandler) serveRawBlock(w http.ResponseWriter, r *http.Request, blockCid cid.Cid, contentPath ipath.Path, begin time.Time) {
-	blockReader, err := i.api.Block().Get(r.Context(), contentPath)
+func (i *gatewayHandler) serveRawBlock(ctx context.Context, w http.ResponseWriter, r *http.Request, resolvedPath ipath.Resolved, contentPath ipath.Path, begin time.Time) {
+	ctx, span := tracing.Span(ctx, "Gateway", "ServeRawBlock", trace.WithAttributes(attribute.String("path", resolvedPath.String())))
+	defer span.End()
+	blockCid := resolvedPath.Cid()
+	blockReader, err := i.api.Block().Get(ctx, resolvedPath)
 	if err != nil {
 		webError(w, "ipfs block get "+blockCid.String(), err, http.StatusInternalServerError)
 		return
@@ -33,10 +39,12 @@ func (i *gatewayHandler) serveRawBlock(w http.ResponseWriter, r *http.Request, b
 	w.Header().Set("Content-Type", "application/vnd.ipld.raw")
 	w.Header().Set("X-Content-Type-Options", "nosniff") // no funny business in the browsers :^)
 
-	// Done: http.ServeContent will take care of
+	// ServeContent will take care of
 	// If-None-Match+Etag, Content-Length and range requests
-	http.ServeContent(w, r, name, modtime, content)
+	_, dataSent, _ := ServeContent(w, r, name, modtime, content)
 
-	// Update metrics
-	i.rawBlockGetMetric.WithLabelValues(contentPath.Namespace()).Observe(time.Since(begin).Seconds())
+	if dataSent {
+		// Update metrics
+		i.rawBlockGetMetric.WithLabelValues(contentPath.Namespace()).Observe(time.Since(begin).Seconds())
+	}
 }
