@@ -7,7 +7,7 @@ require (
 	github.com/ipfs/go-ipfs-blockstore v1.2.0
 	github.com/ipfs/go-ipfs-exchange-interface v0.2.0
 	github.com/ipfs/go-ipfs-regression v0.0.1
-	github.com/ipfs/go-libipfs v0.4.0
+	github.com/ipfs/go-libipfs v0.4.1
 	github.com/ipld/go-ipld-prime v0.9.1-0.20210324083106-dc342a9917db // indirect
 	github.com/libp2p/go-libp2p v0.23.4
 	github.com/libp2p/go-libp2p-kad-dht v0.18.0
